@@ -151,7 +151,7 @@ int main(int argc, char **argv) {
 ]]
 
 		local function quoteln(s: string): string
-			return "\t\t" .. ("%q"):format(s) .. ' "\\n"' .. "\n"
+			return "\t\t\"" .. s:gsub("\\", "\\\\"):gsub("\"", "\\\"") .. '" "\\n"' .. "\n"
 		end
 
 		for name, mod in pairs(modules) do
