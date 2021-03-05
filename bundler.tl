@@ -4,12 +4,33 @@ local config <const> = require("cyan.config")
 local cs <const> = require("cyan.colorstring")
 local fs <const> = require("cyan.fs")
 local graph <const> = require("cyan.graph")
-local lfs <const> = require("lfs")
 local log <const> = require("cyan.log")
 local util <const> = require("cyan.util")
 
-local ivalues <const>, split <const>
-	= util.tab.ivalues, util.str.split
+local lfs <const> = require("lfs")
+
+local parser <const> = require "argparse" ("cyan-bundler", "A proof-of-concept Teal project bundler powered by Cyan")
+
+parser:argument("file", "The .tl file that contains the code to execute")
+parser:argument("target", "Whether to compile to a single Lua file or single C file")
+	:choices{"c", "lua"}
+parser:argument("output", "Output file name")
+
+parser:option("--header"):count("*")
+parser:option("--clib"):count("*")
+
+parser:option("--lua-module")
+	:args(2)
+	:count("*")
+
+local args <const> = parser:parse()
+-- log.debug(args)
+
+local file <const> = args.file as string
+local target <const> = args.target as string
+
+local ivalues <const>, split <const>, map <const>
+	= util.tab.ivalues, util.str.split, util.tab.map
 
 local function assert_log<T>(x: T, msg: string): T
 	if not x then
@@ -19,17 +40,10 @@ local function assert_log<T>(x: T, msg: string): T
 	return x
 end
 
-local file <const> = assert_log(..., "no file given")
-local target <const> = assert_log(select(2, ...), "no target given: expected one of 'lua' or 'c'")
-assert_log(
-	target ~= "lua" or target ~= "c",
-	"expected target to be one of 'lua' or 'c', got: " .. target
-)
-
 local main <const> = fs.path.new(file)
 
 local starting_dir <const> = fs.current_dir()
-local config_path <const> = fs.search_parent_dirs(lfs.currentdir(), config.filename)
+local config_path <const> = fs.search_parent_dirs(starting_dir:to_real_path(), config.filename)
 if not config_path then
 	log.err(config.filename .. " not found")
 	os.exit(1)
@@ -42,12 +56,14 @@ if not lfs.chdir(root_dir:to_real_path()) then
 	os.exit(1)
 end
 
-local cfg_ok <const>, loaded_config <const>, env <const>
-	= common.load_cfg_env_report_errs(true)
-
-assert_log(cfg_ok, "error loading config")
-
+local loaded_config, errs = config.load()
+assert_log(config, "error loading config: " .. table.concat(errs or {}, "\n"))
 assert(lfs.chdir(starting_dir:to_real_path()))
+
+loaded_config.gen_target = "5.3"
+loaded_config.gen_compat = "off"
+
+local env <const> = common.init_env_from_cfg(loaded_config)
 
 local dag <const> = graph.empty()
 dag:insert_file(main)
@@ -123,51 +139,61 @@ local function write_lua()
 	fh:write("\n\n", compiled_main or "error('no main')")
 	fh:close()
 	log.info("Wrote ", cs.highlight(cs.colors.file, outfile))
-	local cmd <const> = "chmod u+x " .. outfile
-	log.info("Executing: ", cmd)
-	os.execute(cmd)
 end
 
 --- Write out to a C file to compile
 local function write_c()
-	local outfile <const> = "out.c"
-	local fh <const> = assert(io.open(outfile, "w"))
-	fh:write[[
-#include <lua.h>
-#include <lualib.h>
-#include <lauxlib.h>
-#include <stdio.h>
+	local function inc(header: string): string
+		return string.format("#include <%s>", header)
+	end
 
+	local headers <const> = {
+		"lua.h",
+		"lualib.h",
+		"lauxlib.h",
+		"stdio.h",
+	}
+
+	for h in ivalues(args.header as {string}) do
+		table.insert(headers, h)
+	end
+
+	local pre <const> = {
+		table.concat(map(headers, inc), "\n"),
+	}
+
+	table.insert(pre, [[
+#define ADD_LIBRARY(name) \
+	lua_pushcfunction(L, luaopen_ ## name ); \
+	lua_setfield(L, -2, #name )
+]])
+
+	table.insert(pre,[[
 int main(int argc, char **argv) {
 	lua_State *L = luaL_newstate();
 	if (!L) {
 		fprintf(stderr, "Could not open Lua state\n");
 		return 3;
 	}
+]])
 
+	table.insert(pre, [[
 	luaL_openlibs(L);
-	
-	const int loaded = luaL_loadstring(L,
-]]
+]])
 
-		local function quoteln(s: string): string
-			return "\t\t\"" .. s:gsub("\\", "\\\\"):gsub("\"", "\\\"") .. '" "\\n"' .. "\n"
+	local clibs <const> = args.clib as {string}
+	if #clibs > 0 then
+		table.insert(pre, [[
+	lua_getglobal(L, "package");
+	lua_getfield(L, -1, "preload");
+]])
+		for lib in ivalues(clibs) do
+			table.insert(pre, "\tADD_LIBRARY(" .. lib .. ");")
 		end
+		table.insert(pre, "\tlua_pop(L, 1);")
+	end
 
-		for name, mod in pairs(modules) do
-			fh:write(quoteln(("package.preload[%q] = function(...)"):format(name)))
-				for ln in split(mod, "\n", true) do
-					fh:write(quoteln(ln))
-				end
-				fh:write(quoteln("end"))
-			end
-
-			for ln in split(compiled_main, "\n", true) do
-				fh:write(quoteln(ln))
-			end
-
-			fh:write[[
-	);
+	local footer <const> = [[
 
 	int exit_code = 0;
 
@@ -199,11 +225,52 @@ cleanup:
 	lua_close(L);
 	return exit_code;
 }]]
+
+	local outfile <const> = "out.c"
+	local fh <const> = assert(io.open(outfile, "w"))
+
+	for s in ivalues(pre) do fh:write(s, "\n") end
+	local function quoteln(s: string): string
+		return "\t\t\"" .. s:gsub("\\", "\\\\"):gsub("\"", "\\\""):match("^%s*(.-)%s*$") .. '\\n"\n'
+	end
+
+	local function writeln(ln: string)
+		if #ln:match("^%s*(.-)%s*$") > 0 then
+			fh:write(quoteln(ln))
+		end
+	end
+
+	local function write_module(name: string, content: string)
+		fh:write(quoteln(("package.preload[%q] = function(...)"):format(name)))
+		for ln in split(content, "\n", true) do
+			writeln(ln)
+		end
+		fh:write(quoteln("end"))
+	end
+
+	fh:write("\tconst int loaded = luaL_loadstring(L,\n")
+
+	for name, mod in pairs(modules) do
+		write_module(name, mod)
+	end
+
+	for m in ivalues(args.lua_module as {{string, string}} or {}) do
+		local name <const> = m[1]
+		local mod_fh <const> = assert(io.open(m[2], "r"))
+		local mod <const> = mod_fh:read("*a")
+		mod_fh:close()
+		log.info("Source copied ", cs.highlight(cs.colors.file, m[2]), " for module ", cs.highlight(cs.colors.file, name))
+		write_module(name, mod)
+	end
+
+	for ln in split(compiled_main, "\n", true) do
+		writeln(ln)
+	end
+	fh:write("\t);\n")
+
+	fh:write(footer)
 	fh:close()
 	log.info("Wrote ", cs.highlight(cs.colors.file, outfile))
-	local cmd <const> = "cc -O3 " .. outfile .. " -llua -o out"
-	log.info("Executing: ", cmd)
-	os.execute(cmd)
 end
 
 if target == "lua" then
